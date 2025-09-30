@@ -1,15 +1,24 @@
 import os
 import time
 import json
-import base64
-import requests
 from pathlib import Path
+from typing import Optional
 
-HOST = os.environ.get("DATABRICKS_HOST")
-TOKEN = os.environ.get("DATABRICKS_TOKEN")
-assert HOST and TOKEN, "Set DATABRICKS_HOST and DATABRICKS_TOKEN env vars"
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.workspace import ImportFormat, Language
+from databricks.sdk.service.jobs import (
+    RunSubmitTaskSettings,
+    NotebookTask,
+    ClusterSpec,
+)
+from databricks.sdk.service.pipelines import (
+    PipelineLibrary,
+    NotebookLibrary,
+)
 
-WS_REPO_PATH = "/Workspace/Repos/shivampanicker/agentbricks"
+# Environment is taken from DATABRICKS_HOST/DATABRICKS_TOKEN (and others) by WorkspaceClient
+
+WS_PATH = "/Workspace/Shared/agentbricks"
 LOCAL_FILES = [
     "content_insurance_datasets.py",
     "dlt_pipeline.py",
@@ -18,144 +27,138 @@ LOCAL_FILES = [
     "register_and_serve_agents.py",
 ]
 
-HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+
+def upload_notebooks(w: WorkspaceClient) -> None:
+    w.workspace.mkdirs(WS_PATH)
+    for fname in LOCAL_FILES:
+        local_path = Path(fname)
+        ws_target = f"{WS_PATH}/{local_path.name}"
+        with open(local_path, "rb") as f:
+            content = f.read()
+        w.workspace.import_(
+            path=ws_target,
+            format=ImportFormat.SOURCE,
+            language=Language.PYTHON,
+            content=content,
+            overwrite=True,
+        )
+        print(f"Imported {fname} -> {ws_target}")
 
 
-def api(method: str, path: str, **kwargs):
-    url = f"{HOST}{path}"
-    r = requests.request(method, url, headers=HEADERS, **kwargs)
-    if not r.ok:
-        raise RuntimeError(f"API {path} failed: {r.status_code} {r.text}")
-    return r.json() if r.text else {}
-
-
-def workspace_mkdirs(path: str):
-    api("POST", "/api/2.0/workspace/mkdirs", json={"path": path})
-
-
-def workspace_import(local_file: Path, ws_path: str):
-    content = local_file.read_bytes()
-    b64 = base64.b64encode(content).decode("utf-8")
-    api(
-        "POST",
-        "/api/2.0/workspace/import",
-        json={
-            "path": ws_path,
-            "format": "SOURCE",
-            "language": "PYTHON",
-            "content": b64,
-            "overwrite": True,
-        },
+def submit_notebook_run(w: WorkspaceClient, notebook_path: str, parameters: Optional[dict] = None) -> None:
+    task = RunSubmitTaskSettings(
+        task_key="notebook",
+        notebook_task=NotebookTask(
+            notebook_path=notebook_path,
+            base_parameters=parameters or {},
+        ),
+        new_cluster=ClusterSpec(
+            spark_version="13.3.x-scala2.12",
+            node_type_id="i3.xlarge",
+            num_workers=1,
+            spark_conf={"spark.databricks.cluster.profile": "singleNode"},
+            custom_tags={"ResourceClass": "SingleNode"},
+        ),
+        timeout_seconds=7200,
     )
+    run = w.jobs.submit(run_name=f"run {Path(notebook_path).name}", tasks=[task])
+    print(f"Submitted run {run.run_id} for {notebook_path}")
+    wait_for_run(w, run.run_id)
 
 
-def jobs_runs_submit_notebook(notebook_path: str, parameters: dict | None = None):
-    payload = {
-        "run_name": f"run {Path(notebook_path).name}",
-        "tasks": [
-            {
-                "task_key": "notebook-task",
-                "notebook_task": {
-                    "notebook_path": notebook_path,
-                    "base_parameters": parameters or {},
-                },
-                "new_cluster": {
-                    "spark_version": "13.3.x-scala2.12",
-                    "node_type_id": "i3.xlarge",
-                    "num_workers": 1,
-                    "spark_conf": {"spark.databricks.cluster.profile": "singleNode"},
-                    "custom_tags": {"ResourceClass": "SingleNode"},
-                },
-                "timeout_seconds": 7200,
-            }
-        ],
-    }
-    res = api("POST", "/api/2.1/jobs/runs/submit", json=payload)
-    run_id = res["run_id"]
-    print(f"Submitted run {run_id} for {notebook_path}")
-    wait_for_run(run_id)
-
-
-def wait_for_run(run_id: int):
+def wait_for_run(w: WorkspaceClient, run_id: int) -> None:
     while True:
-        res = api("GET", f"/api/2.1/jobs/runs/get?run_id={run_id}")
-        state = res["state"]["life_cycle_state"]
-        result = res["state"].get("result_state")
+        r = w.jobs.get_run(run_id)
+        state = r.state.life_cycle_state
+        result = r.state.result_state
         if state in {"TERMINATED", "INTERNAL_ERROR", "SKIPPED"}:
             if result and result != "SUCCESS":
-                raise RuntimeError(f"Run {run_id} failed: {res}")
+                raise RuntimeError(f"Run {run_id} failed: {result}")
             print(f"Run {run_id} finished: {result}")
             return
         print(f"Run {run_id} state: {state}...")
         time.sleep(15)
 
 
-def pipelines_get_by_name(name: str):
-    res = api("GET", "/api/2.0/pipelines")
-    for p in res.get("statuses", []):
-        if p.get("name") == name:
-            return p.get("pipeline_id")
-    return None
+def ensure_pipeline(w: WorkspaceClient, name: str, notebook_ws_path: str, catalog: str, target: str) -> str:
+    # Try to find existing pipeline id
+    existing = [p for p in w.pipelines.list() if p.name == name]
+    if existing:
+        pipeline_id = existing[0].pipeline_id
+        print(f"Updating pipeline {name} ({pipeline_id})")
+        w.pipelines.edit(
+            pipeline_id=pipeline_id,
+            name=name,
+            catalog=catalog,
+            target=target,
+            libraries=[PipelineLibrary(notebook=NotebookLibrary(path=notebook_ws_path))],
+            development=True,
+            continuous=False,
+            channel="CURRENT",
+            photon=True,
+        )
+        return pipeline_id
 
-
-def pipelines_create_or_update_from_file(name: str, config_file: Path):
-    cfg = json.loads(config_file.read_text())
-    cfg["name"] = name
-    existing_id = pipelines_get_by_name(name)
-    if existing_id:
-        print(f"Updating pipeline {name} ({existing_id})")
-        api("PUT", f"/api/2.0/pipelines/{existing_id}", json=cfg)
-        return existing_id
     print(f"Creating pipeline {name}")
-    res = api("POST", "/api/2.0/pipelines", json=cfg)
-    return res["pipeline_id"]
+    p = w.pipelines.create(
+        name=name,
+        catalog=catalog,
+        target=target,
+        libraries=[PipelineLibrary(notebook=NotebookLibrary(path=notebook_ws_path))],
+        development=True,
+        continuous=False,
+        channel="CURRENT",
+        photon=True,
+    )
+    return p.pipeline_id
 
 
-def pipelines_start_and_wait(pipeline_id: str):
-    api("POST", f"/api/2.0/pipelines/{pipeline_id}/updates", json={})
+def start_and_wait_pipeline(w: WorkspaceClient, pipeline_id: str) -> None:
+    w.pipelines.start_update(pipeline_id)
     while True:
-        res = api("GET", f"/api/2.0/pipelines/{pipeline_id}/events")
-        statuses = [e.get("message") for e in res.get("events", [])][-5:]
-        print("Pipeline status (tail):", statuses)
-        # Best-effort poll using updates API
-        st = api("GET", f"/api/2.0/pipelines/{pipeline_id}")
-        if st.get("state") == "IDLE":
+        st = w.pipelines.get(pipeline_id)
+        state = st.state
+        print(f"Pipeline {pipeline_id} state: {state}")
+        if state == "IDLE":
             print(f"Pipeline {pipeline_id} IDLE (completed update)")
             return
         time.sleep(20)
 
 
-def main():
+def main() -> None:
+    w = WorkspaceClient()
+
     print("Uploading notebooks to workspace...")
-    workspace_mkdirs(WS_REPO_PATH)
-    for fname in LOCAL_FILES:
-        local_path = Path(fname)
-        ws_path = f"{WS_REPO_PATH}/{local_path.name}"
-        workspace_import(local_path, ws_path)
-        print(f"Imported {fname} -> {ws_path}")
+    upload_notebooks(w)
 
     print("Running dataset generation notebook...")
-    jobs_runs_submit_notebook(f"{WS_REPO_PATH}/content_insurance_datasets.py")
+    submit_notebook_run(w, f"{WS_PATH}/content_insurance_datasets.py")
 
     print("Creating/Starting Bronze DLT pipeline...")
-    bronze_id = pipelines_create_or_update_from_file(
+    bronze_id = ensure_pipeline(
+        w,
         name="content_insurance_dlt_bronze",
-        config_file=Path("dlt_pipeline_config.json"),
+        notebook_ws_path=f"{WS_PATH}/dlt_pipeline.py",
+        catalog="suncorp_catalog",
+        target="suncorp_bronze_schema",
     )
-    pipelines_start_and_wait(bronze_id)
+    start_and_wait_pipeline(w, bronze_id)
 
     print("Creating/Starting Silver DLT pipeline...")
-    silver_id = pipelines_create_or_update_from_file(
+    silver_id = ensure_pipeline(
+        w,
         name="content_insurance_dlt_silver",
-        config_file=Path("dlt_silver_pipeline_config.json"),
+        notebook_ws_path=f"{WS_PATH}/dlt_silver_pipeline.py",
+        catalog="suncorp_catalog",
+        target="suncorp_silver_schema",
     )
-    pipelines_start_and_wait(silver_id)
+    start_and_wait_pipeline(w, silver_id)
 
     print("Running claims agents notebook...")
-    jobs_runs_submit_notebook(f"{WS_REPO_PATH}/claims_agents.py")
+    submit_notebook_run(w, f"{WS_PATH}/claims_agents.py")
 
     print("Registering models and provisioning serving endpoints...")
-    jobs_runs_submit_notebook(f"{WS_REPO_PATH}/register_and_serve_agents.py")
+    submit_notebook_run(w, f"{WS_PATH}/register_and_serve_agents.py")
 
     print("All steps completed successfully.")
 
